@@ -1,12 +1,11 @@
-// lib/db.ts
-import { Pool, QueryResultRow } from "pg";
+import pkg from "pg";
+const { Pool } = pkg;
 
 export const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: parseInt(process.env.DB_PORT || "5432", 10),
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false, // penting untuk Neon di Vercel
+  },
 });
 
-export type { QueryResultRow };
+export type { QueryResultRow } from "pg";
