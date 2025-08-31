@@ -1,0 +1,357 @@
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/rs/cors"
+	_ "github.com/lib/pq"
+)
+
+var db *sql.DB
+
+// --------------------- Models ---------------------
+
+type Product struct {
+	ID          int     `json:"id"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	Price       float64 `json:"price"`
+	Stock       int     `json:"stock"`
+	IsAvailable bool    `json:"is_available"`
+	CategoryID  int     `json:"category_id"`
+	ImageURL    string  `json:"image_url"`
+}
+
+type Order struct {
+	ID        int       `json:"id"`
+	TableNo   string    `json:"table_no"`
+	Total     float64   `json:"total"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type OrderItem struct {
+	ProductID int     `json:"product_id"`
+	Quantity  int     `json:"quantity"`
+	Price     float64 `json:"price"`
+}
+
+// --------------------- Main ---------------------
+
+func main() {
+	connStr := "user=postgres password=admin123 dbname=coffee_shop sslmode=disable"
+	var err error
+	db, err = sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("✅ Connected to PostgreSQL")
+
+	r := mux.NewRouter()
+
+	// Health check
+	r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		respondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}).Methods("GET")
+
+	// Product routes
+	r.HandleFunc("/products", getProducts).Methods("GET")
+	r.HandleFunc("/products/{id}", getProduct).Methods("GET")
+	r.HandleFunc("/products", createProduct).Methods("POST")
+	r.HandleFunc("/products/{id}", updateProduct).Methods("PUT")
+	r.HandleFunc("/products/{id}", deleteProduct).Methods("DELETE")
+
+	// Order routes
+	r.HandleFunc("/orders", getOrders).Methods("GET")
+	r.HandleFunc("/orders", createOrder).Methods("POST")
+	r.HandleFunc("/orders/{tableNo}", getOrdersByTable).Methods("GET")
+
+	// Root
+	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Welcome to Coffee Shop API"))
+	}).Methods("GET")
+
+	// CORS
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"http://localhost:3000"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		AllowCredentials: true,
+	})
+
+	handler := c.Handler(r)
+	fmt.Println("🚀 Server running on http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", handler))
+}
+
+// --------------------- Product Handlers ---------------------
+
+func getProducts(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT id, name, description, price, stock, is_available, category_id, image_url
+		FROM products
+		ORDER BY id DESC
+	`)
+	if err != nil {
+		log.Println("DB ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var products []Product
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Stock, &p.IsAvailable, &p.CategoryID, &p.ImageURL); err != nil {
+			log.Println("DB SCAN ERROR:", err)
+			respondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		products = append(products, p)
+	}
+
+	respondWithJSON(w, http.StatusOK, products)
+}
+
+func getProduct(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id, err := strconv.Atoi(vars["id"])
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid product ID")
+		return
+	}
+
+	var p Product
+	err = db.QueryRow(`
+		SELECT id, name, description, price, stock, is_available, category_id, image_url
+		FROM products
+		WHERE id=$1
+	`, id).Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Stock, &p.IsAvailable, &p.CategoryID, &p.ImageURL)
+
+	if err != nil {
+		log.Println("DB ERROR:", err)
+		respondWithError(w, http.StatusNotFound, "Product not found")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, p)
+}
+
+func createProduct(w http.ResponseWriter, r *http.Request) {
+	var p Product
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if p.Name == "" || p.Price <= 0 || p.CategoryID == 0 {
+		respondWithError(w, http.StatusBadRequest, "Name, Price, and CategoryID are required")
+		return
+	}
+
+	err := db.QueryRow(`
+		INSERT INTO products (name, description, price, stock, is_available, category_id, image_url)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id
+	`, p.Name, p.Description, p.Price, p.Stock, p.IsAvailable, p.CategoryID, p.ImageURL).Scan(&p.ID)
+
+	if err != nil {
+		log.Println("DB INSERT ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, p)
+}
+
+func updateProduct(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id, err := strconv.Atoi(vars["id"])
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid product ID")
+		return
+	}
+
+	var p Product
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	_, err = db.Exec(`
+		UPDATE products
+		SET name=$1, description=$2, price=$3, stock=$4, is_available=$5, category_id=$6, image_url=$7
+		WHERE id=$8
+	`, p.Name, p.Description, p.Price, p.Stock, p.IsAvailable, p.CategoryID, p.ImageURL, id)
+	if err != nil {
+		log.Println("DB UPDATE ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	p.ID = id
+	respondWithJSON(w, http.StatusOK, p)
+}
+
+func deleteProduct(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id, err := strconv.Atoi(vars["id"])
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid product ID")
+		return
+	}
+
+	_, err = db.Exec("DELETE FROM products WHERE id=$1", id)
+	if err != nil {
+		log.Println("DB DELETE ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]string{"message": "Product deleted successfully"})
+}
+
+// --------------------- Order Handlers ---------------------
+
+func getOrders(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query(`
+		SELECT id, table_no, total, status, created_at
+		FROM orders
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		log.Println("DB SELECT ALL ORDERS ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var orders []Order
+	for rows.Next() {
+		var o Order
+		if err := rows.Scan(&o.ID, &o.TableNo, &o.Total, &o.Status, &o.CreatedAt); err != nil {
+			log.Println("DB SCAN ORDER ERROR:", err)
+			respondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		orders = append(orders, o)
+	}
+
+	respondWithJSON(w, http.StatusOK, orders)
+}
+
+func createOrder(w http.ResponseWriter, r *http.Request) {
+	var order struct {
+		TableNo string      `json:"table_no"`
+		Items   []OrderItem `json:"items"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&order); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	var total float64
+	for _, item := range order.Items {
+		total += item.Price * float64(item.Quantity)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		log.Println("DB TX BEGIN ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var orderID int
+	err = tx.QueryRow(`
+		INSERT INTO orders (table_no, total, status)
+		VALUES ($1, $2, 'pending')
+		RETURNING id
+	`, order.TableNo, total).Scan(&orderID)
+	if err != nil {
+		tx.Rollback()
+		log.Println("DB INSERT ORDER ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	for _, item := range order.Items {
+		_, err = tx.Exec(`
+			INSERT INTO order_items (order_id, product_id, quantity, price)
+			VALUES ($1, $2, $3, $4)
+		`, orderID, item.ProductID, item.Quantity, item.Price)
+		if err != nil {
+			tx.Rollback()
+			log.Println("DB INSERT ORDER ITEM ERROR:", err)
+			respondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Println("DB TX COMMIT ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"order_id": orderID,
+		"message":  "Order created successfully",
+	})
+}
+
+func getOrdersByTable(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	tableNo := vars["tableNo"]
+
+	rows, err := db.Query(`
+		SELECT o.id, o.table_no, o.total, o.status, o.created_at
+		FROM orders o
+		WHERE o.table_no = $1
+		ORDER BY o.created_at DESC
+	`, tableNo)
+	if err != nil {
+		log.Println("DB SELECT ORDER ERROR:", err)
+		respondWithError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var orders []Order
+	for rows.Next() {
+		var o Order
+		if err := rows.Scan(&o.ID, &o.TableNo, &o.Total, &o.Status, &o.CreatedAt); err != nil {
+			log.Println("DB SCAN ORDER ERROR:", err)
+			respondWithError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		orders = append(orders, o)
+	}
+
+	respondWithJSON(w, http.StatusOK, orders)
+}
+
+// --------------------- Helper ---------------------
+
+func respondWithError(w http.ResponseWriter, code int, message string) {
+	respondWithJSON(w, code, map[string]string{"error": message})
+}
+
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(payload)
+}
